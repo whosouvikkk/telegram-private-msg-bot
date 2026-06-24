@@ -1,10 +1,8 @@
 import os
 import logging
 import certifi
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response, status
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram import Update, Bot
 from motor.motor_asyncio import AsyncIOMotorClient
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -19,82 +17,80 @@ try:
 except ValueError:
     ADMIN_ID = 0
 
-# Globals
-ptb_app = None
+app = FastAPI()
+
+# Safe Lazy Initialization (Exactly like your OSINT bot)
+bot = None
 mappings_col = None
 
-async def relay_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Triggers when a normal user messages the support bot."""
-    if not ADMIN_ID: 
-        logger.error("Admin ID not configured.")
-        return
+def init_services():
+    global bot, mappings_col
+    if bot is None:
+        bot = Bot(token=BOT_TOKEN)
+        client = AsyncIOMotorClient(MONGO_URI, tlsCAFile=certifi.where())
+        db = client.support_bot_db 
+        mappings_col = db.relay_message_mappings
+
+async def process_message(update: Update):
+    """Processes the message synchronously so Vercel does not freeze."""
+    if not update.message: return
 
     user = update.effective_user
-    header = f"👤 <b>{user.full_name}</b> (@{user.username})\n🆔 #USER_{user.id}"
-    
-    try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=header, parse_mode="HTML")
-        admin_msg = await update.message.copy(chat_id=ADMIN_ID)
-        
-        # PERMANENT SAVE: Insert into a SAFE, SEPARATE MongoDB collection
-        await mappings_col.update_one(
-            {"_id": admin_msg.message_id}, 
-            {"$set": {"user_id": user.id}}, 
-            upsert=True
-        )
-        await update.message.reply_text("Your message has been sent to the admin. Please wait for a reply.")
-    except Exception as e:
-        logger.error(f"Relay Error: {e}")
+    user_id = user.id
 
-async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Triggers when YOU reply to a forwarded message."""
-    replied_msg = update.message.reply_to_message
-    if not replied_msg: return 
+    # --- 1. ADMIN REPLYING ---
+    if user_id == ADMIN_ID and update.message.reply_to_message:
+        replied_msg = update.message.reply_to_message
         
-    try:
-        # Look up the user ID from the database
+        # Look up original sender in MongoDB
         record = await mappings_col.find_one({"_id": replied_msg.message_id})
         
         if record:
             target_user_id = record["user_id"]
-            await update.message.copy(chat_id=target_user_id)
-            await update.message.reply_text("✅ Reply delivered.")
+            try:
+                await update.message.copy(chat_id=target_user_id)
+                await update.message.reply_text("✅ Reply delivered.")
+            except Exception as e:
+                logger.error(f"Reply Error: {e}")
+                await update.message.reply_text(f"❌ Failed to send: {e}")
         else:
             await update.message.reply_text("❌ User ID not found in MongoDB.")
-    except Exception as e:
-        logger.error(f"Reply Error: {e}")
-        await update.message.reply_text(f"❌ Failed to send: {e}")
+        return # Stop processing
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global ptb_app, mappings_col
-    
-    # 1. Connect to MongoDB safely
-    client = AsyncIOMotorClient(MONGO_URI, tlsCAFile=certifi.where())
-    db = client.support_bot_db # Using a separate database name for ultimate safety
-    mappings_col = db.relay_message_mappings
-
-    # 2. Start Telegram Bot properly for Serverless
-    ptb_app = Application.builder().token(BOT_TOKEN).build()
-    ptb_app.add_handler(MessageHandler(filters.ALL & ~filters.User(ADMIN_ID), relay_to_admin))
-    ptb_app.add_handler(MessageHandler(filters.ALL & filters.User(ADMIN_ID) & filters.REPLY, reply_to_user))
-    
-    await ptb_app.initialize()
-    await ptb_app.start() # <-- CRITICAL FIX FOR VERCEL
-    yield
-    await ptb_app.stop()  # <-- CRITICAL FIX FOR VERCEL
-    await ptb_app.shutdown()
-    client.close()
-
-app = FastAPI(lifespan=lifespan)
+    # --- 2. NORMAL USER MESSAGING THE BOT ---
+    if user_id != ADMIN_ID:
+        if not ADMIN_ID: 
+            logger.error("Admin ID not configured.")
+            return
+            
+        header = f"👤 <b>{user.full_name}</b> (@{user.username})\n🆔 #USER_{user.id}"
+        
+        try:
+            # Send header, then forward actual message
+            await bot.send_message(chat_id=ADMIN_ID, text=header, parse_mode="HTML")
+            admin_msg = await update.message.copy(chat_id=ADMIN_ID)
+            
+            # Save mapping permanently to MongoDB
+            await mappings_col.update_one(
+                {"_id": admin_msg.message_id}, 
+                {"$set": {"user_id": user.id}}, 
+                upsert=True
+            )
+            await update.message.reply_text("Your message has been sent to the admin. Please wait for a reply.")
+        except Exception as e:
+            logger.error(f"Relay Error: {e}")
 
 @app.post("/api/webhook")
 async def telegram_webhook(req: Request):
     """Listens for Telegram messages."""
     try:
+        init_services()
         data = await req.json()
-        update = Update.de_json(data, ptb_app.bot)
-        await ptb_app.process_update(update)
+        update = Update.de_json(data, bot)
+        
+        # Vercel is now FORCED to wait until this finishes
+        await process_message(update) 
+        
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"Webhook Error: {e}")
