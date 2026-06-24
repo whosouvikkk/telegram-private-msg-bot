@@ -25,7 +25,9 @@ mappings_col = None
 
 async def relay_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Triggers when a normal user messages the support bot."""
-    if not ADMIN_ID: return
+    if not ADMIN_ID: 
+        logger.error("Admin ID not configured.")
+        return
 
     user = update.effective_user
     header = f"👤 <b>{user.full_name}</b> (@{user.username})\n🆔 #USER_{user.id}"
@@ -72,13 +74,15 @@ async def lifespan(app: FastAPI):
     db = client.support_bot_db # Using a separate database name for ultimate safety
     mappings_col = db.relay_message_mappings
 
-    # 2. Start Telegram Bot
+    # 2. Start Telegram Bot properly for Serverless
     ptb_app = Application.builder().token(BOT_TOKEN).build()
     ptb_app.add_handler(MessageHandler(filters.ALL & ~filters.User(ADMIN_ID), relay_to_admin))
     ptb_app.add_handler(MessageHandler(filters.ALL & filters.User(ADMIN_ID) & filters.REPLY, reply_to_user))
     
     await ptb_app.initialize()
+    await ptb_app.start() # <-- CRITICAL FIX FOR VERCEL
     yield
+    await ptb_app.stop()  # <-- CRITICAL FIX FOR VERCEL
     await ptb_app.shutdown()
     client.close()
 
